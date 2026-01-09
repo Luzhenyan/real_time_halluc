@@ -15,7 +15,8 @@
 │   │   └── train_prefill_probes_all_layers.py  # 训练 prefill 幻觉 probe
 │   ├── decode/                       # Decode 阶段
 │   │   ├── train_token_probe.py      # 训练位置 probe (检测关键 token)
-│   │   └── train_hallu_probes_at_key_positions.py  # 训练 decode 幻觉 probe
+│   │   ├── train_hallu_probes_at_key_positions.py  # 训练 decode 幻觉 probe
+│   │   └── eval_dynamic_pipeline.py  # 动态位置检测 + 幻觉检测评估
 │   └── eval/                         # 评估/测试
 │       ├── eval_pos_probe_span.py    # 评估位置 probe 的 span 检测
 │       ├── eval_end_to_end_realtime.py  # 端到端实时评估
@@ -117,6 +118,16 @@ python eval_end_to_end_realtime.py \
   --hallu_probe_base ../../probe/hallu_probe \
   --max_samples 100 \
   --balanced_eval
+
+# 3. 动态 Pipeline 评估 (支持多种位置检测策略)
+cd ../decode
+python eval_dynamic_pipeline.py \
+  --dataset triviaqa_test \
+  --model /path/to/llama3-8b-instruct \
+  --pos_probe_path ../../probe/pos_probe.joblib \
+  --pos_select_strategy threshold_last \
+  --pos_threshold 0.8 \
+  --max_samples 200
 
 # 3. 可视化 token 级置信度
 python visualize_pos_scores.py \
