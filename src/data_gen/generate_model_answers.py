@@ -25,7 +25,9 @@ def parse_args():
                         choices=LIST_OF_DATASETS + [f"{x}_test" for x in LIST_OF_DATASETS])
     parser.add_argument("--verbose", action='store_true', help='print more information')
     parser.add_argument("--n_samples", type=int, help='number of examples to use', default=None)
-
+    # 分片参数，用于多GPU并行
+    parser.add_argument("--shard_id", type=int, default=None, help="Shard ID for multi-GPU parallel processing (0-indexed)")
+    parser.add_argument("--num_shards", type=int, default=None, help="Total number of shards for parallel processing")
 
     return parser.parse_args()
 
@@ -374,8 +376,8 @@ def imdb_preprocess(model_name, reviews, labels):
 
 def triviqa_preprocess(model_name, all_questions, labels):
     prompts = []
-    if 'instruct' in model_name.lower():
-        prompts = all_questions
+    if 'instruct' in model_name.lower() or 'qwen' in model_name.lower():
+        prompts = list(all_questions)
     else:
         for q in all_questions:
             prompts.append(f'''Q: {q}
@@ -419,7 +421,7 @@ def load_winobias(dev_or_test):
 
 def winobias_preprocess(model_name, all_questions, labels):
     sentences, q, q_instruct = all_questions
-    if 'instruct' in model_name.lower():
+    if 'instruct' in model_name.lower() or 'qwen' in model_name.lower():
         prompts = [x + ' ' + y for x, y in zip(sentences, q_instruct)]
     else:
         prompts = [x + ' ' + y for x, y in zip(sentences, q)]
@@ -547,31 +549,90 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     stop_token_id = None
-    if 'instruct' not in args.model.lower():
+    if 'instruct' not in args.model.lower() and 'qwen' not in args.model.lower():
         stop_token_id = tokenizer.encode('\n', add_special_tokens=False)[-1]
     all_questions, context, labels, max_new_tokens, origin, preprocess_fn, stereotype, type_, wrong_labels = load_data(args.dataset)
 
     if not os.path.exists('../output'):
         os.makedirs('../output')
 
-    file_path_output_ids = f"../output/{MODEL_FRIENDLY_NAMES[args.model]}-input_output_ids-{args.dataset}.pt"
-    file_path_scores = f"../output/{MODEL_FRIENDLY_NAMES[args.model]}-scores-{args.dataset}.pt"
-    file_path_answers = f"../output/{MODEL_FRIENDLY_NAMES[args.model]}-answers-{args.dataset}.csv"
+    # 确定输出文件路径（支持分片）
+    base_name = f"{MODEL_FRIENDLY_NAMES[args.model]}-answers-{args.dataset}"
+    if args.shard_id is not None and args.num_shards is not None:
+        file_path_output_ids = f"../output/{MODEL_FRIENDLY_NAMES[args.model]}-input_output_ids-{args.dataset}_shard{args.shard_id}.pt"
+        file_path_scores = f"../output/{MODEL_FRIENDLY_NAMES[args.model]}-scores-{args.dataset}_shard{args.shard_id}.pt"
+        file_path_answers = f"../output/{base_name}_shard{args.shard_id}.csv"
+    else:
+        file_path_output_ids = f"../output/{MODEL_FRIENDLY_NAMES[args.model]}-input_output_ids-{args.dataset}.pt"
+        file_path_scores = f"../output/{MODEL_FRIENDLY_NAMES[args.model]}-scores-{args.dataset}.pt"
+        file_path_answers = f"../output/{base_name}.csv"
 
     if dataset_size:
-        all_questions = all_questions[:dataset_size]
-        labels = labels[:dataset_size]
-        if 'mnli' in args.dataset:
+        if 'winobias' in args.dataset and isinstance(all_questions, tuple):
+            all_questions = (
+                all_questions[0].iloc[:dataset_size].reset_index(drop=True),
+                all_questions[1].iloc[:dataset_size].reset_index(drop=True),
+                all_questions[2].iloc[:dataset_size].reset_index(drop=True)
+            )
+        else:
+            all_questions = all_questions[:dataset_size]
+        labels = labels.iloc[:dataset_size].reset_index(drop=True) if hasattr(labels, 'iloc') else labels[:dataset_size]
+        if 'mnli' in args.dataset and origin is not None:
             origin = origin[:dataset_size]
-        if 'winogrande' in args.dataset:
+        if 'winogrande' in args.dataset and wrong_labels is not None:
             wrong_labels = wrong_labels[:dataset_size]
+        if 'winobias' in args.dataset:
+            if stereotype is not None:
+                stereotype = stereotype.iloc[:dataset_size].reset_index(drop=True)
+            if type_ is not None:
+                type_ = type_.iloc[:dataset_size].reset_index(drop=True)
+            if wrong_labels is not None:
+                wrong_labels = wrong_labels.iloc[:dataset_size].reset_index(drop=True) if hasattr(wrong_labels, 'iloc') else wrong_labels[:dataset_size]
+
+    # 数据分片（多GPU并行）
+    if args.shard_id is not None and args.num_shards is not None:
+        if 'winobias' in args.dataset and isinstance(all_questions, tuple):
+            total = len(all_questions[0])
+        else:
+            total = len(all_questions)
+
+        shard_size = (total + args.num_shards - 1) // args.num_shards
+        start_idx = args.shard_id * shard_size
+        end_idx = min(start_idx + shard_size, total)
+
+        if 'winobias' in args.dataset and isinstance(all_questions, tuple):
+            all_questions = (
+                all_questions[0].iloc[start_idx:end_idx].reset_index(drop=True),
+                all_questions[1].iloc[start_idx:end_idx].reset_index(drop=True),
+                all_questions[2].iloc[start_idx:end_idx].reset_index(drop=True)
+            )
+        else:
+            all_questions = all_questions[start_idx:end_idx]
+        labels = labels.iloc[start_idx:end_idx].reset_index(drop=True) if hasattr(labels, 'iloc') else labels[start_idx:end_idx]
+        if 'mnli' in args.dataset and origin is not None:
+            origin = origin[start_idx:end_idx]
+        if 'winogrande' in args.dataset and wrong_labels is not None:
+            wrong_labels = wrong_labels[start_idx:end_idx]
+        if 'winobias' in args.dataset:
+            if stereotype is not None:
+                stereotype = stereotype.iloc[start_idx:end_idx].reset_index(drop=True)
+            if type_ is not None:
+                type_ = type_.iloc[start_idx:end_idx].reset_index(drop=True)
+            if wrong_labels is not None:
+                wrong_labels = wrong_labels.iloc[start_idx:end_idx].reset_index(drop=True) if hasattr(wrong_labels, 'iloc') else wrong_labels[start_idx:end_idx]
+
+        n_samples = len(all_questions[0]) if 'winobias' in args.dataset and isinstance(all_questions, tuple) else len(all_questions)
+        print(f"Shard {args.shard_id}/{args.num_shards}: processing {n_samples} samples (idx {start_idx}~{end_idx})")
+        if n_samples == 0:
+            print(f"Shard {args.shard_id}: No samples to process, exiting.")
+            return
 
     output_csv = {}
     if preprocess_fn:
         if 'winobias' in args.dataset:
-            output_csv['raw_question'] = all_questions[0]
+            output_csv['raw_question'] = list(all_questions[0])
         else:
-            output_csv['raw_question'] = all_questions
+            output_csv['raw_question'] = list(all_questions) if hasattr(all_questions, '__iter__') else all_questions
         if 'natural_questions' in args.dataset:
             with_context = True if 'with_context' in args.dataset else False
             print('preprocessing nq')
@@ -591,19 +652,20 @@ def main():
     wandb.summary[f'acc'] = acc
     print(f"Accuracy:", acc)
 
+    n_samples_final = len(all_questions)
     output_csv['question'] = all_questions
     output_csv['model_answer'] = model_answers
-    output_csv['correct_answer'] = labels
+    output_csv['correct_answer'] = list(labels) if hasattr(labels, 'tolist') else labels
     output_csv['automatic_correctness'] = correctness
 
     if 'exact_answer' in res:
         output_csv['exact_answer'] = res['exact_answer']
-        output_csv['valid_exact_answer'] = 1
+        output_csv['valid_exact_answer'] = [1] * n_samples_final
     if 'incorrect_answer' in res:
         output_csv['incorrect_answer'] = res['incorrect_answer']
     if 'winobias' in args.dataset:
-        output_csv['stereotype'] = stereotype
-        output_csv['type'] = type_
+        output_csv['stereotype'] = stereotype.tolist() if hasattr(stereotype, 'tolist') else list(stereotype)
+        output_csv['type'] = type_.tolist() if hasattr(type_, 'tolist') else list(type_)
     if 'nli' in args.dataset:
         output_csv['origin'] = origin
 

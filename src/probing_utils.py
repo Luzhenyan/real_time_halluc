@@ -18,6 +18,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 N_LAYERS_MISTRAL = 32
 N_LAYER_LLAMA = 32
+N_LAYER_QWEN3 = 36  # Qwen3-8B has 36 layers
 
 LAYERS_TO_TRACE_MISTRAL = {
     'mlp': [f"model.layers.{i}.mlp" for i in range(N_LAYERS_MISTRAL)],
@@ -35,12 +36,23 @@ LAYERS_TO_TRACE_LLAMA = {
     'attention_output': [f"model.layers.{i}.self_attn.o_proj" for i in range(N_LAYER_LLAMA)],
 }
 
+LAYERS_TO_TRACE_QWEN3 = {
+    'mlp': [f"model.layers.{i}.mlp" for i in range(N_LAYER_QWEN3)],
+    'mlp_last_layer_only': [f"model.layers.{i}.mlp.down_proj" for i in range(N_LAYER_QWEN3)],
+    'mlp_last_layer_only_input': [f"model.layers.{i}.mlp.down_proj" for i in range(N_LAYER_QWEN3)],
+    'attention_heads': [f"model.layers.{i}.self_attn.o_proj" for i in range(N_LAYER_QWEN3)],
+    'attention_output': [f"model.layers.{i}.self_attn.o_proj" for i in range(N_LAYER_QWEN3)],
+}
+
 LAYERS_TO_TRACE = {
     'mistralai/Mistral-7B-Instruct-v0.2': LAYERS_TO_TRACE_MISTRAL,
     'mistralai/Mistral-7B-v0.3': LAYERS_TO_TRACE_MISTRAL,
     'meta-llama/Meta-Llama-3-8B-Instruct': LAYERS_TO_TRACE_LLAMA,
     'meta-llama/Meta-Llama-3-8B': LAYERS_TO_TRACE_LLAMA,
     '/mnt/pcllzy/llama3-instruction-8b': LAYERS_TO_TRACE_LLAMA,
+    '/home/models/llama3-8b-instruct': LAYERS_TO_TRACE_LLAMA,
+    '/var/luzhenyan/Meta-Llama-3-8B-Instruct': LAYERS_TO_TRACE_LLAMA,
+    '/var/wangyicheng/models/Qwen3-8B': LAYERS_TO_TRACE_QWEN3,
 }
 
 N_LAYERS = {
@@ -49,6 +61,9 @@ N_LAYERS = {
     'meta-llama/Meta-Llama-3-8B-Instruct': N_LAYER_LLAMA,
     'meta-llama/Meta-Llama-3-8B': N_LAYER_LLAMA,
     '/mnt/pcllzy/llama3-instruction-8b': N_LAYER_LLAMA,
+    '/home/models/llama3-8b-instruct': N_LAYER_LLAMA,
+    '/var/luzhenyan/Meta-Llama-3-8B-Instruct': N_LAYER_LLAMA,
+    '/var/wangyicheng/models/Qwen3-8B': N_LAYER_QWEN3,
 }
 
 HIDDEN_SIZE = {
@@ -58,6 +73,9 @@ HIDDEN_SIZE = {
     'meta-llama/Meta-Llama-3-8B-Instruct': 8192,
     'meta-llama/Meta-Llama-3-8B': 8192,
     '/mnt/pcllzy/llama3-instruction-8b': 8192,
+    '/home/models/llama3-8b-instruct': 8192,
+    '/var/luzhenyan/Meta-Llama-3-8B-Instruct': 8192,
+    '/var/wangyicheng/models/Qwen3-8B': 4096,
     'google/gemma-7b': 3072,
     'google/gemma-7b-it': 3072,
 }
@@ -76,11 +94,14 @@ LIST_OF_DATASETS = ['triviaqa',
 LIST_OF_TEST_DATASETS = [f"{x}_test" for x in LIST_OF_DATASETS]
 
 LIST_OF_MODELS = ['mistralai/Mistral-7B-Instruct-v0.2',
-                                            'mistralai/Mistral-7B-v0.3',
-                                            'meta-llama/Meta-Llama-3-8B',
-                                            'meta-llama/Meta-Llama-3-8B-Instruct',
-                                            '/mnt/pcllzy/llama3-instruction-8b',
-                                            ]
+                  'mistralai/Mistral-7B-v0.3',
+                  'meta-llama/Meta-Llama-3-8B',
+                  'meta-llama/Meta-Llama-3-8B-Instruct',
+                  '/mnt/pcllzy/llama3-instruction-8b',
+                  '/home/models/llama3-8b-instruct',
+                  '/var/luzhenyan/Meta-Llama-3-8B-Instruct',
+                  '/var/wangyicheng/models/Qwen3-8B',
+                  ]
 
 MODEL_FRIENDLY_NAMES = {
     'mistralai/Mistral-7B-Instruct-v0.2': 'mistral-7b-instruct',
@@ -88,6 +109,9 @@ MODEL_FRIENDLY_NAMES = {
     'meta-llama/Meta-Llama-3-8B': 'llama-3-8b',
     'meta-llama/Meta-Llama-3-8B-Instruct': 'llama-3-8b-instruct',
     '/mnt/pcllzy/llama3-instruction-8b': 'llama-3-8b-instruct-local',
+    '/home/models/llama3-8b-instruct': 'llama3-8b-instruct',
+    '/var/luzhenyan/Meta-Llama-3-8B-Instruct': 'llama3-8b-instruct',
+    '/var/wangyicheng/models/Qwen3-8B': 'qwen3-8b',
 }
 
 LIST_OF_PROBING_LOCATIONS = ['mlp', 'mlp_last_layer_only', 'mlp_last_layer_only_input', 'attention_output']
@@ -102,7 +126,7 @@ def encode(prompt, tokenizer, model_name):
 
 
 def tokenize(prompt, tokenizer, model_name, tokenizer_args=None):
-    if 'instruct' in model_name.lower():
+    if 'instruct' in model_name.lower() or 'qwen' in model_name.lower():
         messages = [
             {"role": "user", "content": prompt}
         ]
@@ -124,12 +148,13 @@ def find_prompt_end_in_full_ids(
     在 `full_ids_1d`（通常是 Prompt+Answer 的全量序列）中，严格通过 ID 匹配找到 prompt 的结束位置（q_len）。
 
     设计目标：
-    - 彻底规避“保存的 full_ids 包含 chat template，但重新 tokenize(question) 的模板略有差异”造成的错位
+    - 彻底规避”保存的 full_ids 包含 chat template，但重新 tokenize(question) 的模板略有差异”造成的错位
     - 对 BOS 差异做容错：full 有 BOS/ prompt 没 BOS，或相反
+    - 对 chat template 差异做容错：prompt 有 chat template 但 full 没有，或相反
 
     返回：
       - q_len（int）：prompt 在 full_ids 中的结束 index（Python slicing 语义，full_ids[:q_len] 即 prompt 部分）
-    """
+    “””
     full = full_ids_1d.detach().cpu()
     prompt = prompt_ids_1d.detach().cpu()
 
@@ -138,9 +163,48 @@ def find_prompt_end_in_full_ids(
     if prompt.ndim != 1:
         prompt = prompt.view(-1)
 
+    # Chat template special tokens (Qwen3 style)
+    # <|im_start|> = 151644, <|im_end|> = 151645
+    CHAT_TEMPLATE_TOKENS = {151644, 151645, 151643}  # im_start, im_end, im_sep
+
+    def strip_chat_template(ids):
+        “””去掉 chat template tokens 和相邻的换行符”””
+        if ids.numel() == 0:
+            return ids
+        start = 0
+        while start < ids.numel():
+            tok = ids[start].item()
+            if tok in CHAT_TEMPLATE_TOKENS:
+                start += 1
+            elif tok == 198 and start > 0:  # \n after special token
+                start += 1
+            elif tok in {872, 78191}:  # 'user', 'assistant' role tokens
+                start += 1
+            else:
+                break
+        end = ids.numel()
+        changed = True
+        while changed and end > start:
+            changed = False
+            tok = ids[end - 1].item()
+            if tok in CHAT_TEMPLATE_TOKENS:
+                end -= 1
+                changed = True
+            elif tok == 198:  # \n
+                end -= 1
+                changed = True
+        return ids[start:end]
+
     candidates = [prompt]
     if allow_bos_mismatch and prompt.numel() >= 2:
         candidates.append(prompt[1:])
+
+    # 添加去掉 chat template 后的候选（Qwen3 兼容）
+    prompt_stripped = strip_chat_template(prompt)
+    if prompt_stripped.numel() > 0 and prompt_stripped.numel() != prompt.numel():
+        candidates.append(prompt_stripped)
+        if allow_bos_mismatch and prompt_stripped.numel() >= 2:
+            candidates.append(prompt_stripped[1:])
 
     for cand in candidates:
         if cand.numel() == 0:
@@ -459,7 +523,17 @@ def compile_probing_indices(data, n_samples, seed, n_validation_samples=0):
 def get_probing_layer_names(probe_at, model_name):
     if probe_at in ['mlp_last_layer_only', 'mlp_last_layer_only_input']:
         probe_at = 'mlp'
-    layers_to_trace = LAYERS_TO_TRACE[model_name][probe_at]
+    # 支持动态模型路径：如果 model_name 不在预定义字典中，根据模型名推断
+    if model_name in LAYERS_TO_TRACE:
+        layers_to_trace = LAYERS_TO_TRACE[model_name][probe_at]
+    elif 'qwen' in model_name.lower():
+        layers_to_trace = LAYERS_TO_TRACE_QWEN3[probe_at]
+    elif 'llama' in model_name.lower():
+        layers_to_trace = LAYERS_TO_TRACE_LLAMA[probe_at]
+    elif 'mistral' in model_name.lower():
+        layers_to_trace = LAYERS_TO_TRACE_MISTRAL[probe_at]
+    else:
+        layers_to_trace = LAYERS_TO_TRACE_LLAMA[probe_at]
     return layers_to_trace
 
 
