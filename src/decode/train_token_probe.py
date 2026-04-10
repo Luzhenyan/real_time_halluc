@@ -68,6 +68,14 @@ def parse_args():
         help="Optional tag appended to the output base name (keeps legacy naming when empty). "
              "Example: --out_tag layer-15 -> ..._pure_layer-15.joblib",
     )
+    parser.add_argument(
+        '--pos_mode',
+        type=str,
+        default='all',
+        choices=['first', 'last', 'all'],
+        help="Which tokens in the exact-answer span to use as positives: "
+             "first=only first token; last=only last token; all=all tokens in span.",
+    )
     return parser.parse_args()
 
 def forward_on_ids(model, input_ids_1d: torch.Tensor, *, probe_at: str, layer_names: list[str] | None):
@@ -136,9 +144,17 @@ def main():
             span = get_indices_of_exact_answer(tokenizer, ids, row['exact_answer'], args.model, output_ids=output_ids_1d)
             if not span: continue
 
-            # Positives: ALL tokens inside the exact-answer span
-            pos_indices = [int(i) for i in span]
-            pos_indices = [i for i in pos_indices if 0 <= i < len(ids)]
+            # Positives: tokens inside the exact-answer span, selected by pos_mode
+            all_span_indices = [int(i) for i in span]
+            all_span_indices = [i for i in all_span_indices if 0 <= i < len(ids)]
+            if not all_span_indices:
+                continue
+            if args.pos_mode == 'first':
+                pos_indices = [all_span_indices[0]]
+            elif args.pos_mode == 'last':
+                pos_indices = [all_span_indices[-1]]
+            else:  # 'all'
+                pos_indices = all_span_indices
             if not pos_indices:
                 continue
 
