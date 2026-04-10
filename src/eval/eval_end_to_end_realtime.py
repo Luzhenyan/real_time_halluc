@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import os
+import time
 import torch
 import numpy as np
 import pandas as pd
@@ -12,7 +13,7 @@ from baukit import TraceDict
 
 # 导入 LLMsKnow 中的工具
 import sys
-sys.path.append('/mnt/pcllzy_2/LLMsKnow/src')
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from probing_utils import (
     MODEL_FRIENDLY_NAMES,
     load_model_and_validate_gpu,
@@ -41,22 +42,25 @@ def parse_args():
         help="When --pos_probe_at mlp: which layer index's MLP output to feed into pos probe (default: last layer).",
     )
     parser.add_argument('--hallu_probe_base', type=str, required=True, help="Base path for Hallucination Probes (checkpoints/...)")
+    parser.add_argument('--decode_probe_base', type=str, default=None, help="Base path for Decode Probes (if different from hallu_probe_base)")
     parser.add_argument('--max_samples', type=int, default=100)
-    parser.add_argument('--stop_threshold', type=float, default=0.6)
+    parser.add_argument('--stop_threshold', type=float, default=0.6, help="Threshold for early exit (used for decode if prefill_stop_threshold not set)")
+    parser.add_argument('--prefill_stop_threshold', type=float, default=None, help="Separate threshold for prefill early exit (if None, uses stop_threshold)")
     parser.add_argument('--pos_threshold', type=float, default=0.5)
     parser.add_argument(
         '--pos_trigger_mode',
         type=str,
         default='threshold',
-        choices=['threshold', 'exit_span'],
+        choices=['threshold', 'exit_span', 'lookahead'],
         help="How pos_probe triggers decode-stage hallucination probing. "
              "'threshold': trigger on any step with pos_score>=pos_threshold (legacy). "
-             "'exit_span': treat high pos_score as being inside answer span; trigger when leaving span, "
-             "using cached features from the last high-scoring step (aims to approximate exact_answer_last_token).",
+             "'exit_span': treat high pos_score as being inside answer span; trigger when leaving span. "
+             "'lookahead': wait for N consecutive low-score steps after a high-score step to confirm trigger.",
     )
     parser.add_argument('--pos_enter_threshold', type=float, default=0.90, help="For pos_trigger_mode=exit_span: threshold to enter span.")
     parser.add_argument('--pos_exit_threshold', type=float, default=0.80, help="For pos_trigger_mode=exit_span: threshold to stay in span; falling below triggers exit.")
     parser.add_argument('--pos_enter_k', type=int, default=2, help="For pos_trigger_mode=exit_span: require k consecutive >= enter_threshold to enter span.")
+    parser.add_argument('--lookahead', type=int, default=6, help="For pos_trigger_mode=lookahead: number of consecutive low-score steps to confirm trigger.")
     parser.add_argument('--max_new_tokens', type=int, default=64)
     parser.add_argument('--layers', type=int, nargs='+', default=None, help="Specific layers to use for detection (e.g., 10 15 20)")
     parser.add_argument(
@@ -139,7 +143,51 @@ def parse_args():
         action='store_true',
         help="If set, print AUROC for several aggregations without rerunning the model.",
     )
+    parser.add_argument(
+        '--output_csv',
+        type=str,
+        default=None,
+        help="If set, save detailed per-sample results to this CSV file.",
+    )
     return parser.parse_args()
+
+
+class LookaheadTracker:
+    """Lookahead 策略追踪器：等待连续 N 步低分后确认触发位置"""
+    def __init__(self, threshold=0.9, lookahead=6):
+        self.threshold = threshold
+        self.lookahead = lookahead
+        self.candidate_step = None
+        self.candidate_score = None
+        self.candidate_feats = None
+        self.steps_since_last_high = 0
+        self.confirmed = False
+        self.confirmed_step = None
+        self.confirmed_feats = None
+
+    def update(self, step, score, feats=None):
+        """更新状态，返回是否刚确认触发"""
+        if self.confirmed:
+            return False
+        if score >= self.threshold:
+            self.candidate_step = step
+            self.candidate_score = score
+            self.candidate_feats = feats
+            self.steps_since_last_high = 0
+        else:
+            if self.candidate_step is not None:
+                self.steps_since_last_high += 1
+                if self.steps_since_last_high >= self.lookahead:
+                    self.confirmed = True
+                    self.confirmed_step = self.candidate_step
+                    self.confirmed_feats = self.candidate_feats
+                    return True
+        return False
+
+    def get_confirmed(self):
+        """返回确认的触发位置和特征"""
+        return self.confirmed_step, self.confirmed_feats
+
 
 def load_hallu_probes_dict(base_path, layers, token_type):
     """加载多个层的探针"""
@@ -147,11 +195,21 @@ def load_hallu_probes_dict(base_path, layers, token_type):
     for l in layers:
         # 尝试几种可能的命名模式
         paths_to_try = [
+            # fixed/corrected 版本（最高优先）
+            f"{base_path}_prefill_layer-{l}_fixed.pkl",
+            f"{base_path}_decode_layer-{l}_fixed.pkl",
+            f"{base_path}_prefill_layer-{l}_corrected.pkl",
+            f"{base_path}_decode_layer-{l}_corrected.pkl",
+            # 标准命名格式
             f"{base_path}_prefill_seed-0_layer-{l}_token-{token_type}.pkl",
             f"{base_path}_seed-0_layer-{l}_token-{token_type}.pkl",
-            # legacy (prefer new prefill probes when present)
+            # legacy
             f"{base_path}_layer-{l}_token-{token_type}.pkl",
         ]
+        if token_type == "exact_answer_last_token":
+            for kp in ["exact_answer_last_token", "exact_answer_before_first_token", "first", "full"]:
+                paths_to_try.append(f"{base_path}_keypos-{kp}_layer-{l}_seed-0.pkl")
+                paths_to_try.append(f"{base_path}_hallu_{kp}_layer-{l}.pkl")
         found = False
         for path in paths_to_try:
             if os.path.exists(path):
@@ -246,13 +304,15 @@ def run_e2e_realtime_eval(args):
                     args.pos_probe_layer = int(model.config.num_hidden_layers) - 1
             pos_probe_layer = int(args.pos_probe_layer)
     
-    # 加载指定的探测器
+    # 加载指定的探测器（支持 decode_probe_base 独立指定）
     prefill_probes = load_hallu_probes_dict(args.hallu_probe_base, prefill_layers, "last_q_token")
-    decode_probes = load_hallu_probes_dict(args.hallu_probe_base, decode_layers, "exact_answer_last_token")
+    decode_base = args.decode_probe_base if args.decode_probe_base else args.hallu_probe_base
+    decode_probes = load_hallu_probes_dict(decode_base, decode_layers, "exact_answer_last_token")
 
     # 准备数据
-    llms_know_root = '/mnt/pcllzy_2/LLMsKnow'
-    df = pd.read_csv(f'{llms_know_root}/output/{friendly}-answers-{args.dataset}.csv')
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    output_dir = os.path.join(script_dir, '..', '..', 'output')
+    df = pd.read_csv(os.path.join(output_dir, f'{friendly}-answers-{args.dataset}.csv'))
     # IMPORTANT: keep original row index for alignment with `ids_all` (which is saved in original order)
     df = df.copy()
     df["_orig_idx"] = df.index.astype(int)
@@ -274,7 +334,7 @@ def run_e2e_realtime_eval(args):
         else:
             df = df.sample(n=min(args.max_samples, len(df)), random_state=42)
     
-    ids_file = f'{llms_know_root}/output/{friendly}-input_output_ids-{args.dataset}.pt'
+    ids_file = os.path.join(output_dir, f'{friendly}-input_output_ids-{args.dataset}.pt')
     ids_all = torch.load(ids_file, map_location='cpu')
     
     results = []
@@ -290,9 +350,17 @@ def run_e2e_realtime_eval(args):
     span_found = 0
     span_predicted = 0
     
+    # 设置 prefill 和 decode 阶段的阈值
+    prefill_threshold = args.prefill_stop_threshold if args.prefill_stop_threshold is not None else args.stop_threshold
+    decode_threshold = args.stop_threshold
+
     mode = "prefill-only" if args.prefill_only else ("decode-only" if args.decode_only else "e2e")
     layers_msg = decode_layers if args.decode_only else (prefill_layers if args.prefill_only else detect_layers)
     print(f"\n🚀 Starting {mode} evaluation on {len(df)} samples using layers: {layers_msg}")
+    if not args.decode_only:
+        print(f"   Prefill stop threshold: {prefill_threshold:.3f}")
+    if not args.prefill_only:
+        print(f"   Decode stop threshold: {decode_threshold:.3f}")
     
     def aggregate_score(layer_to_prob: dict, *, agg: str, top_k: int, layer_min: int | None):
         items = [(int(l), float(p)) for l, p in layer_to_prob.items()]
@@ -359,6 +427,9 @@ def run_e2e_realtime_eval(args):
             last_high_pos_score = None
             last_high_feats = None  # dict[int(layer) -> np.ndarray(1,H)] in decode feature space (after scaler/pca if needed)
             triggered_at_step = None
+            # lookahead tracker (for pos_trigger_mode=lookahead)
+            lookahead_tracker = LookaheadTracker(threshold=args.pos_threshold, lookahead=args.lookahead)
+            detected_key_token_pos = None
             decode_layer_probs_at_target = {}
             hallu_score_decode_at_target = None
             # Span-based decode probe evaluation (token-level within exact_answer span, aggregated to sample-level)
@@ -423,7 +494,7 @@ def run_e2e_realtime_eval(args):
                             max_hallu_prob = halluc_prob
                         prefill_layer_probs[int(l)] = halluc_prob
 
-                        if halluc_prob >= args.stop_threshold:
+                        if halluc_prob >= prefill_threshold:
                             status = "early_exit_prefill"
                             trigger_info = {"step": 0, "prob": halluc_prob, "layer": l}
                             break
@@ -492,6 +563,22 @@ def run_e2e_realtime_eval(args):
                         if float(pos_score) >= float(args.pos_threshold):
                             should_trigger_now = True
                             trigger_use_feats = None  # use current step's mlp_out_step
+                    elif args.pos_trigger_mode == "lookahead":
+                        # Lookahead: wait for N consecutive low-score steps after high-score to confirm
+                        current_feats = {}
+                        for l in decode_layers:
+                            if l in mlp_out_step:
+                                f = mlp_out_step[int(l)][0, -1, :].cpu().float().numpy().reshape(1, -1)
+                                current_feats[int(l)] = f
+                        just_confirmed = lookahead_tracker.update(int(step + 1), float(pos_score), current_feats if current_feats else None)
+                        if just_confirmed and triggered_at_step is None:
+                            confirmed_step, confirmed_feats = lookahead_tracker.get_confirmed()
+                            should_trigger_now = True
+                            triggered_at_step = confirmed_step
+                            detected_key_token_pos = confirmed_step
+                            trigger_step_for_info = confirmed_step
+                            trigger_pos_score_for_info = lookahead_tracker.candidate_score or float(pos_score)
+                            trigger_use_feats = confirmed_feats
                     else:
                         # exit_span: interpret high score as "inside span"
                         enter_thr = float(args.pos_enter_threshold)
@@ -634,7 +721,7 @@ def run_e2e_realtime_eval(args):
                                 prev = decode_layer_probs.get(int(l), 0.0)
                                 if float(halluc_prob) > float(prev):
                                     decode_layer_probs[int(l)] = float(halluc_prob)
-                                    if halluc_prob >= args.stop_threshold:
+                                    if halluc_prob >= decode_threshold:
                                         status = "early_exit_decode"
                                     trigger_info = {
                                         "step": int(trigger_step_for_info),
@@ -657,6 +744,30 @@ def run_e2e_realtime_eval(args):
                         if next_token.item() == tokenizer.eos_token_id:
                             break
             
+            # Lookahead fallback: 序列结束但还有未确认的 candidate，使用它
+            if args.pos_trigger_mode == "lookahead" and triggered_at_step is None:
+                if lookahead_tracker.candidate_step is not None and not lookahead_tracker.confirmed:
+                    triggered_at_step = lookahead_tracker.candidate_step
+                    detected_key_token_pos = lookahead_tracker.candidate_step
+                    first_pos_trigger_step = lookahead_tracker.candidate_step
+                    if lookahead_tracker.candidate_feats:
+                        for l in decode_layers:
+                            if l in decode_probes and int(l) in lookahead_tracker.candidate_feats:
+                                hs_mlp = lookahead_tracker.candidate_feats[int(l)].reshape(-1)
+                                probe_obj = decode_probes[l]
+                                if isinstance(probe_obj, dict) and 'scaler' in probe_obj:
+                                    hs_scaled = probe_obj['scaler'].transform(hs_mlp.reshape(1, -1))
+                                    prob_right = probe_obj['clf'].predict_proba(hs_scaled)[0, 1]
+                                else:
+                                    clf = probe_obj['clf'] if isinstance(probe_obj, dict) else probe_obj
+                                    prob_right = clf.predict_proba(hs_mlp.reshape(1, -1))[0, 1]
+                                halluc_prob = 1.0 - prob_right
+                                if float(halluc_prob) > max_decode_hallu_prob:
+                                    max_decode_hallu_prob = float(halluc_prob)
+                                prev = decode_layer_probs.get(int(l), 0.0)
+                                if float(halluc_prob) > float(prev):
+                                    decode_layer_probs[int(l)] = float(halluc_prob)
+
             # hallu_score for AUROC: aggregate across layers (prefill+decode)
             combined_layer_probs = dict(prefill_layer_probs)
             for l, p in decode_layer_probs.items():
@@ -773,6 +884,12 @@ def run_e2e_realtime_eval(args):
 
     # 统计性能
     res_df = pd.DataFrame(results)
+
+    # 保存逐样本结果到 CSV（如果指定了 --output_csv）
+    if args.output_csv:
+        res_df.to_csv(args.output_csv, index=False)
+        print(f"Per-sample results saved to {args.output_csv}")
+
     print("\n=== End-to-End Real-time Performance ===")
     print(res_df['status'].value_counts())
     
